@@ -1,0 +1,253 @@
+using Amazon;
+using Amazon.S3;
+using System;
+using System.Threading.Tasks;
+using Amazon.Lambda.Core;
+using Newtonsoft.Json;
+using Amazon.S3.Model;
+using System.Collections.Generic;
+using System.Text;
+using System.Net;
+using System.IO;
+
+// Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.Json.JsonSerializer))]
+
+namespace CopyObjectsFromS3ToS3
+{
+    public class CustomResourceRequest<T>
+    {
+        public string StackId { get; set; }
+        public string ResponseURL { get; set; }
+        public string RequestType { get; set; }
+        public string ResourceType { get; set; }
+        public string RequestId { get; set; }
+        public string LogicalResourceId { get; set; }
+        public string PhysicalResourceId { get; set; }
+        public T ResourceProperties { get; set; }
+    }
+    public class RequestData
+    {
+        
+        public string FolderName { get; set; }
+
+      
+        public string DestinationS3Bucket { get; set; }
+
+       
+        public string SourceS3Bucket { get; set; }
+
+      
+        public string RegionEndpoint { get; set; }
+
+     
+        public string SourceSolutionFolder { get; set; }
+
+    }
+    public class CustomResourceResponse
+    {
+        public string Status { get; set; }
+        public string Reason { get; set; }
+        public string PhysicalResourceId { get; set; }
+        public string StackId { get; set; }
+        public string RequestId { get; set; }
+        public string LogicalResourceId { get; set; }
+        public object Data { get; set; }
+    }
+    public class Function
+    {
+        private static IAmazonS3 s3Client;
+        public void FunctionHandler(CustomResourceRequest<RequestData> requestData, ILambdaContext context)
+        {
+            context.Logger.LogLine("CustomResourceHandler Function Begin : Lambda invoked by custom resource from CF");
+            try
+            {
+                context.Logger.LogLine("CustomResourceHandler RequestData:--->" + JsonConvert.SerializeObject(requestData));
+
+                var requestObject = new RequestData
+                {
+                    SourceS3Bucket = requestData.ResourceProperties.SourceS3Bucket,
+                    DestinationS3Bucket = requestData.ResourceProperties.DestinationS3Bucket,
+                    RegionEndpoint = requestData.ResourceProperties.RegionEndpoint,
+                    FolderName = requestData.ResourceProperties.FolderName,
+                    SourceSolutionFolder = requestData.ResourceProperties.SourceSolutionFolder
+                };
+
+                var response = new CustomResourceResponse
+                {
+                    StackId = requestData.StackId,
+                    RequestId = requestData.RequestId,
+                    LogicalResourceId = requestData.LogicalResourceId,
+                    PhysicalResourceId = "custom_physical_resource",
+                    Reason = "See CloudWatch logs for detail",
+                    Status = "SUCCESS"
+                };
+
+                context.Logger.LogLine("CustomResourceHandler Function Begin : Lambda invoked by custom resource from CF" +
+                    JsonConvert.SerializeObject(requestData));
+
+                context.Logger.LogLine("requestData.RequestType..." + requestData.RequestType);
+
+                switch (requestData.RequestType)
+                {
+                    case "Create":
+                        context.Logger.LogLine("Started Copying Object " + DateTime.Now);
+                        CopyingObjectAsync(requestObject).Wait();
+                        context.Logger.LogLine("Completed Copying Object " + DateTime.Now);
+                        context.Logger.LogLine("uploading response to ..." + requestData.ResponseURL);
+                        UploadResponse(requestData.ResponseURL, response);
+                        context.Logger.LogLine("Configuration completed.");
+                        break;
+
+                    case "Delete":
+                        LambdaLogger.Log("Received Delete request\n");
+                        context.Logger.LogLine("Started Deleting Object " + DateTime.Now);
+                        DeletingObjectAsync(requestObject).Wait();
+                        context.Logger.LogLine("Completed Deleting Object " + DateTime.Now);
+
+                        context.Logger.LogLine("uploading response to ..." + requestData.ResponseURL);
+                        UploadResponse(requestData.ResponseURL, response);
+                        context.Logger.LogLine("Deletion completed for Everything.");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                context.Logger.LogLine("exception: " + ex.ToString());
+                context.Logger.LogLine("Error in CustomResourceHandler");
+            }
+            finally
+            {
+                context.Logger.LogLine("Done Created: \n");
+            }
+        }
+        private void UploadResponse(string responseURL, CustomResourceResponse response)
+        {
+            string str = JsonConvert.SerializeObject(response);
+            byte[] bytes = Encoding.UTF8.GetBytes(str);
+            LambdaLogger.Log("trying to upload json " + str);
+            HttpWebRequest httpWebRequest = WebRequest.Create(responseURL) as HttpWebRequest;
+            httpWebRequest.Method = "PUT";
+            httpWebRequest.ContentType = string.Empty;
+            httpWebRequest.ContentLength = bytes.Length;
+            LambdaLogger.Log(string.Format("Starting upload of {0}", bytes.Length));
+            using (Stream requestStream = httpWebRequest.GetRequestStream())
+                requestStream.Write(bytes, 0, bytes.Length);
+            LambdaLogger.Log(string.Format("Result of upload is {0}", (httpWebRequest.GetResponse() as HttpWebResponse).StatusCode));
+        }
+        private static async Task CopyingObjectAsync(RequestData requestData)
+        {
+            try
+            {
+                RegionEndpoint bucketRegion = RegionEndpoint.GetBySystemName(requestData.RegionEndpoint);
+                s3Client = new AmazonS3Client(bucketRegion);
+                var s3ObjCollection = new List<S3Object>();
+
+                ListObjectsV2Request request = new ListObjectsV2Request();
+                request.BucketName = requestData.SourceS3Bucket;
+
+                if (!string.IsNullOrEmpty(requestData.SourceSolutionFolder))
+                    request.Prefix = requestData.SourceSolutionFolder;
+
+                ListObjectsV2Response response;
+
+                do
+                {
+                    response = await s3Client.ListObjectsV2Async(request);
+                    response.S3Objects.ForEach(entry => s3ObjCollection.Add(entry));
+                    Console.WriteLine("Next Continuation Token: {0}", response.NextContinuationToken);
+                    request.ContinuationToken = response.NextContinuationToken;
+                } while (response.IsTruncated);
+
+                if (!string.IsNullOrEmpty(requestData.SourceSolutionFolder))
+                    CopyFromDestinationFolder(requestData, s3ObjCollection);
+                else
+                    CopyFromBucket(requestData, s3ObjCollection);
+            }
+            catch (AmazonS3Exception amazonS3Exception)
+            {
+                Console.WriteLine("S3 error occurred. Exception: " + amazonS3Exception.ToString());
+                Console.ReadKey();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Exception: " + e.ToString());
+                Console.ReadKey();
+            }
+        }
+
+        private static void CopyFromDestinationFolder(RequestData requestData, List<S3Object> s3ObjCollection)
+        {
+            Parallel.ForEach(s3ObjCollection, obj =>
+            {
+                var copyRequest = new CopyObjectRequest
+                {
+                    SourceBucket = obj.BucketName,
+                    SourceKey = obj.Key,
+                    DestinationBucket = requestData.DestinationS3Bucket,
+                    DestinationKey = $"{requestData.FolderName}/{obj.Key.Substring(requestData.SourceSolutionFolder.Length + 1)}",
+                    CannedACL = S3CannedACL.PublicRead
+                };
+                s3Client.CopyObjectAsync(copyRequest).Wait();
+            });
+        }
+
+        private static void CopyFromBucket(RequestData requestData, List<S3Object> s3ObjCollection)
+        {
+            Parallel.ForEach(s3ObjCollection, obj =>
+            {
+                var copyRequest = new CopyObjectRequest
+                {
+                    SourceBucket = obj.BucketName,
+                    SourceKey = obj.Key,
+                    DestinationBucket = requestData.DestinationS3Bucket,
+                    DestinationKey = $"{requestData.FolderName}/{obj.Key}",
+                    CannedACL = S3CannedACL.PublicRead
+                };
+                s3Client.CopyObjectAsync(copyRequest).Wait();
+            });
+        }
+
+        private static async Task DeletingObjectAsync(RequestData requestData)
+        {
+            try
+            {
+                RegionEndpoint bucketRegion = RegionEndpoint.GetBySystemName(requestData.RegionEndpoint);
+                s3Client = new AmazonS3Client(bucketRegion);
+                var s3ObjCollection = new List<S3Object>();
+
+                ListObjectsV2Request request = new ListObjectsV2Request
+                {
+                    BucketName = requestData.DestinationS3Bucket,
+                    Prefix = requestData.TenantFolderName
+                };
+                ListObjectsV2Response response;
+
+                do
+                {
+                    response = await s3Client.ListObjectsV2Async(request);
+                    response.S3Objects.ForEach(entry => s3ObjCollection.Add(entry));
+                    request.ContinuationToken = response.NextContinuationToken;
+                } while (response.IsTruncated);
+
+                Parallel.ForEach(s3ObjCollection, i =>
+                {
+                    var deleteRequest = new DeleteObjectRequest
+                    {
+                        BucketName = i.BucketName,
+                        Key = i.Key
+                    };
+                    s3Client.DeleteObjectAsync(deleteRequest).Wait();
+                });
+            }
+            catch (AmazonS3Exception amazonS3Exception)
+            {
+                Console.WriteLine("S3 error occurred. Exception: " + amazonS3Exception.ToString());
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Exception: " + e.ToString());
+            }
+        }
+    }
+}
